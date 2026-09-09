@@ -5,8 +5,10 @@
 - Upstream: <https://github.com/ultralytics/ultralytics.git>
 - Tracking branch: `upstream/main`
 - Local base at scaffold creation: `b5f6c7024`
+
 - Latest synchronization: `7866d1217` (`upstream/main`)
 - Sync date: `2026-09-09`
+
 
 ## Synchronization checklist
 
