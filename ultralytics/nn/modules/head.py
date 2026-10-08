@@ -25,6 +25,7 @@ __all__ = (
     "Classify",
     "Depth",
     "Detect",
+    "DualDetectPose",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -283,6 +284,101 @@ class Detect(nn.Module):
         for name in tuple(self._modules):
             if name.startswith("one2one_"):
                 setattr(self, name[8:] if end2end else name, None)
+
+
+class DualDetectPose(Detect):
+    """YOLO head with independent detection and pose branches over shared feature maps.
+
+    The detection branch is inherited from :class:`Detect`. The pose branch is a separate :class:`Pose` head, so both
+    branches predict their own boxes and class scores while sharing the backbone and neck that produce ``P3``--``P5``.
+
+    Args:
+        nc_det (int): Number of classes for the detection branch.
+        nc_pose (int): Number of classes for the pose branch, normally one for person.
+        kpt_shape (tuple): Number of keypoints and dimensions per keypoint.
+        reg_max (int): Maximum number of distribution-focal-loss channels.
+        end2end (bool): Whether to create one-to-one end-to-end branches.
+        ch (tuple): Channels of the P3--P5 feature maps.
+
+    Examples:
+        Create a dual head for an 80-class detector and 17-keypoint person pose model
+        >>> head = DualDetectPose(80, 1, (17, 3), ch=(192, 384, 576))
+        >>> features = [torch.randn(1, c, s, s) for c, s in zip((192, 384, 576), (80, 40, 20))]
+        >>> set(head(features)) == {"detect", "pose"}
+        True
+    """
+
+    def __init__(
+        self,
+        nc_det: int = 80,
+        nc_pose: int = 1,
+        kpt_shape: tuple = (17, 3),
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize independent detection and pose heads."""
+        super().__init__(nc_det, reg_max, end2end, ch)
+        self._anchors = torch.empty(0)
+        self._strides = torch.empty(0)
+        self.nc_det = nc_det
+        self.nc_pose = nc_pose
+        self.kpt_shape = kpt_shape
+        self.pose = Pose(nc_pose, kpt_shape, reg_max, end2end, ch)
+
+    @property
+    def stride(self) -> torch.Tensor:
+        """Return the shared detection strides."""
+        return self._stride
+
+    @stride.setter
+    def stride(self, value: torch.Tensor) -> None:
+        """Set strides for both branches."""
+        self._stride = value
+        if hasattr(self, "pose"):
+            self.pose.stride = value
+
+    @property
+    def anchors(self) -> torch.Tensor:
+        """Return detection anchor points."""
+        return self._anchors
+
+    @anchors.setter
+    def anchors(self, value: torch.Tensor) -> None:
+        """Set anchor points for both branches."""
+        self._anchors = value
+        if hasattr(self, "pose"):
+            self.pose.anchors = value
+
+    @property
+    def strides(self) -> torch.Tensor:
+        """Return expanded anchor strides."""
+        return self._strides
+
+    @strides.setter
+    def strides(self, value: torch.Tensor) -> None:
+        """Set expanded anchor strides for both branches."""
+        self._strides = value
+        if hasattr(self, "pose"):
+            self.pose.strides = value
+
+    def forward(self, x: list[torch.Tensor]) -> dict[str, object]:
+        """Run both independent heads on the shared feature maps."""
+        # During DetectionModel stride discovery the parent head is temporarily marked training while its children are
+        # eval. Keep the pose branch in the same mode so it returns raw training predictions for stride calculation.
+        self.pose.training = self.training
+        return {"detect": Detect.forward(self, x), "pose": self.pose(x)}
+
+    def bias_init(self) -> None:
+        """Initialize detection and pose branch biases after strides have been computed."""
+        Detect.bias_init(self)
+        self.pose.stride = self.stride
+        self.pose.bias_init()
+
+    def fuse(self) -> None:
+        """Fuse both branches for inference."""
+        Detect.fuse(self)
+        self.pose.fuse()
 
 
 class Segment(Detect):

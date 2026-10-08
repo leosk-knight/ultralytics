@@ -1010,6 +1010,58 @@ class PoseLoss26(v8PoseLoss):
         return kpts_loss, kpts_obj_loss, rle_loss
 
 
+class _DualBranchModel:
+    """Expose one branch of a dual head through the model interface expected by the task losses."""
+
+    def __init__(self, parent: torch.nn.Module, head: torch.nn.Module, class_weights: torch.Tensor | None = None):
+        """Initialize a branch view backed by the parent model parameters."""
+        self.parent = parent
+        self.model = [head]
+        self.args = parent.args
+        self.class_weights = class_weights
+        self.kpt_oks_sigmas = getattr(parent, "kpt_oks_sigmas", None)
+
+    def parameters(self):
+        """Return the shared model parameters for device inference."""
+        return self.parent.parameters()
+
+
+class DualTaskLoss:
+    """Combine independent detection and pose losses from a shared dual-task model."""
+
+    def __init__(self, model: torch.nn.Module, det_gain: float = 1.0, pose_gain: float = 1.0):
+        """Initialize detection and pose criteria for the two branches."""
+        head = model.model[-1]
+        self.det_gain = det_gain
+        self.pose_gain = pose_gain
+        self.person_class = model.yaml.get("person_class", 0)
+        self.det_loss = v8DetectionLoss(_DualBranchModel(model, head, getattr(model, "class_weights", None)))
+        self.pose_loss = v8PoseLoss(_DualBranchModel(model, head.pose))
+        self.loss_names = tuple(f"det_{name}" for name in self.det_loss.loss_names) + tuple(
+            f"pose_{name}" for name in self.pose_loss.loss_names
+        )
+
+    def __call__(
+        self, preds: dict[str, dict[str, torch.Tensor]], batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Calculate and combine detection and pose losses from separate head outputs."""
+        if "keypoints" not in batch:
+            raise KeyError("Dual-task training requires a 'keypoints' field in every batch.")
+        det_total, det_items = self.det_loss(preds["detect"], batch)
+        person = batch["cls"].view(-1).long() == self.person_class
+        pose_batch = {
+            **batch,
+            "batch_idx": batch["batch_idx"][person],
+            "cls": torch.zeros_like(batch["cls"][person]),
+            "bboxes": batch["bboxes"][person],
+            "keypoints": batch["keypoints"][person],
+        }
+        pose_total, pose_items = self.pose_loss(preds["pose"], pose_batch)
+        items = {f"det_{name}": self.det_gain * value for name, value in det_items.items()}
+        items.update({f"pose_{name}": self.pose_gain * value for name, value in pose_items.items()})
+        return torch.cat((self.det_gain * det_total, self.pose_gain * pose_total)), items
+
+
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""
 
